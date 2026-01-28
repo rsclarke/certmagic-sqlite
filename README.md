@@ -104,6 +104,27 @@ storage, err := certmagicsqlite.New("/path/to/certs.db",
 |--------|---------|-------------|
 | `WithLockTTL(d)` | 2 minutes | Duration after which locks expire and can be stolen |
 | `WithQueryTimeout(d)` | 3 seconds | Timeout for individual database queries |
+| `WithOwnerID(id)` | Random UUID | Identifier for lock ownership (see below) |
+
+### Lock Owner ID
+
+By default, a random UUID is generated each time the storage is created. This means after a restart, the application cannot clean up its own stale locks — it must wait for them to expire.
+
+For faster recovery after restarts, provide a stable owner ID:
+
+```go
+import "os"
+
+hostname, _ := os.Hostname()
+storage, err := certmagicsqlite.New("/path/to/certs.db",
+    certmagicsqlite.WithOwnerID(hostname),
+)
+```
+
+| Deployment | Recommended ownerID |
+|------------|---------------------|
+| Single instance | Hostname or fixed string |
+| Multiple instances | Unique per instance (hostname, pod name, etc.) |
 
 ## Recommended SQLite Settings for `NewWithDB`
 

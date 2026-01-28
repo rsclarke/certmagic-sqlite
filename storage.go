@@ -51,6 +51,19 @@ func WithQueryTimeout(d time.Duration) Option {
 	return func(s *SQLiteStorage) { s.queryTimeout = d }
 }
 
+// WithOwnerID sets a custom owner identifier for distributed locking.
+// By default, a random UUID is generated on each instantiation.
+//
+// Providing a stable ownerID (e.g., hostname, instance ID) allows the
+// application to clean up its own stale locks after a restart, rather
+// than waiting for them to expire.
+//
+// For single-instance deployments, use a stable ID like hostname.
+// For multi-instance deployments, ensure each instance has a unique ID.
+func WithOwnerID(id string) Option {
+	return func(s *SQLiteStorage) { s.ownerID = id }
+}
+
 // New creates a new SQLiteStorage instance. The dsn parameter should be
 // a path to the SQLite database file, or ":memory:" for an in-memory database.
 // The storage will manage the database connection and close it when Close() is called.
@@ -413,24 +426,25 @@ func (s *SQLiteStorage) tryLock(ctx context.Context, name string) (bool, error) 
 }
 
 // Unlock releases a named lock.
-// Returns fs.ErrNotExist if the lock was not held by this instance.
+// Returns fs.ErrNotExist if the lock was not held by this owner.
 func (s *SQLiteStorage) Unlock(ctx context.Context, name string) error {
 	s.locksMu.Lock()
-	_, owned := s.locks[name]
-	if owned {
-		delete(s.locks, name)
-	}
+	delete(s.locks, name)
 	s.locksMu.Unlock()
-
-	if !owned {
-		return fs.ErrNotExist
-	}
 
 	ctx, cancel := context.WithTimeout(ctx, s.queryTimeout)
 	defer cancel()
 
-	_, err := s.db.ExecContext(ctx,
+	result, err := s.db.ExecContext(ctx,
 		`DELETE FROM certmagic_locks WHERE name = ? AND owner_id = ?`,
 		name, s.ownerID)
-	return err
+	if err != nil {
+		return err
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fs.ErrNotExist
+	}
+	return nil
 }

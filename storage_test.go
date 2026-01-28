@@ -469,10 +469,13 @@ func TestLockOwnership(t *testing.T) {
 		t.Fatalf("s2 Lock after expiration failed: %v", err)
 	}
 
-	if err := s1.Unlock(ctx, lockName); err != nil {
-		t.Fatalf("s1 Unlock failed: %v", err)
+	// s1's unlock should fail because s2 now owns the lock
+	err = s1.Unlock(ctx, lockName)
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("s1 Unlock should return fs.ErrNotExist (lock stolen), got: %v", err)
 	}
 
+	// s1 should not be able to acquire lock held by s2
 	ctx2, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
 	err = s1.Lock(ctx2, lockName)
@@ -480,7 +483,10 @@ func TestLockOwnership(t *testing.T) {
 		t.Errorf("s1 should not be able to acquire lock held by s2, got: %v", err)
 	}
 
-	s2.Unlock(ctx, lockName)
+	// s2 can unlock its own lock
+	if err := s2.Unlock(ctx, lockName); err != nil {
+		t.Fatalf("s2 Unlock failed: %v", err)
+	}
 }
 
 func TestMemoryDB(t *testing.T) {
@@ -578,4 +584,109 @@ func TestMillisecondTTL(t *testing.T) {
 		t.Fatalf("Lock after 50ms TTL expiration failed: %v", err)
 	}
 	s.Unlock(ctx, lockName)
+}
+
+func TestWithOwnerID(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	ctx := context.Background()
+	lockName := "owner-test-lock"
+
+	s1, err := New(dbPath, WithOwnerID("instance-1"))
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+
+	if err := s1.Lock(ctx, lockName); err != nil {
+		t.Fatalf("Lock failed: %v", err)
+	}
+	s1.Close()
+
+	s2, err := New(dbPath, WithOwnerID("instance-1"))
+	if err != nil {
+		t.Fatalf("failed to recreate storage: %v", err)
+	}
+	defer s2.Close()
+
+	if err := s2.Unlock(ctx, lockName); err != nil {
+		t.Fatalf("Unlock with same ownerID should succeed: %v", err)
+	}
+
+	if err := s2.Lock(ctx, lockName); err != nil {
+		t.Fatalf("Lock after unlock should succeed: %v", err)
+	}
+	s2.Unlock(ctx, lockName)
+}
+
+func TestWithOwnerIDDifferentOwners(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	ctx := context.Background()
+	lockName := "different-owner-lock"
+
+	s1, err := New(dbPath, WithOwnerID("instance-1"), WithLockTTL(time.Minute))
+	if err != nil {
+		t.Fatalf("failed to create storage 1: %v", err)
+	}
+	defer s1.Close()
+
+	s2, err := New(dbPath, WithOwnerID("instance-2"), WithLockTTL(time.Minute))
+	if err != nil {
+		t.Fatalf("failed to create storage 2: %v", err)
+	}
+	defer s2.Close()
+
+	if err := s1.Lock(ctx, lockName); err != nil {
+		t.Fatalf("s1 Lock failed: %v", err)
+	}
+
+	err = s2.Unlock(ctx, lockName)
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("s2 Unlock should return fs.ErrNotExist, got: %v", err)
+	}
+
+	ctx2, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	err = s2.Lock(ctx2, lockName)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("s2 Lock should timeout, got: %v", err)
+	}
+
+	s1.Unlock(ctx, lockName)
+}
+
+func TestStableOwnerIDAfterRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	ctx := context.Background()
+	ownerID := "my-stable-app-id"
+
+	s1, err := New(dbPath, WithOwnerID(ownerID))
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	if err := s1.Lock(ctx, "lock1"); err != nil {
+		t.Fatalf("Lock 1 failed: %v", err)
+	}
+	if err := s1.Lock(ctx, "lock2"); err != nil {
+		t.Fatalf("Lock 2 failed: %v", err)
+	}
+	s1.Close()
+
+	s2, err := New(dbPath, WithOwnerID(ownerID))
+	if err != nil {
+		t.Fatalf("failed to recreate storage: %v", err)
+	}
+	defer s2.Close()
+
+	if err := s2.Unlock(ctx, "lock1"); err != nil {
+		t.Fatalf("Unlock lock1 after restart failed: %v", err)
+	}
+	if err := s2.Unlock(ctx, "lock2"); err != nil {
+		t.Fatalf("Unlock lock2 after restart failed: %v", err)
+	}
+
+	if err := s2.Lock(ctx, "lock1"); err != nil {
+		t.Fatalf("Reacquire lock1 failed: %v", err)
+	}
+	if err := s2.Lock(ctx, "lock2"); err != nil {
+		t.Fatalf("Reacquire lock2 failed: %v", err)
+	}
 }
