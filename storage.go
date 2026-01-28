@@ -28,12 +28,12 @@ var (
 // using a SQLite database for persistence.
 type SQLiteStorage struct {
 	db           *sql.DB
-	dsn          string
 	lockTTL      time.Duration
 	queryTimeout time.Duration
 	ownerID      string
 	locks        map[string]struct{}
 	locksMu      sync.Mutex
+	managedDB    bool // true if we opened the DB and should close it
 }
 
 // Option configures a SQLiteStorage instance.
@@ -53,66 +53,91 @@ func WithQueryTimeout(d time.Duration) Option {
 
 // New creates a new SQLiteStorage instance. The dsn parameter should be
 // a path to the SQLite database file, or ":memory:" for an in-memory database.
+// The storage will manage the database connection and close it when Close() is called.
+// Recommended PRAGMAs (WAL, synchronous=NORMAL, busy_timeout) are applied automatically.
 func New(dsn string, opts ...Option) (*SQLiteStorage, error) {
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	if err := applyPragmas(db, dsn); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	s, err := NewWithDB(db, opts...)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	s.managedDB = true
+
+	return s, nil
+}
+
+func applyPragmas(db *sql.DB, dsn string) error {
+	isMemory := dsn == ":memory:" || strings.Contains(dsn, "mode=memory")
+
+	pragmas := []string{
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA busy_timeout=5000",
+	}
+	if !isMemory {
+		pragmas = append([]string{"PRAGMA journal_mode=WAL"}, pragmas...)
+	}
+
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// NewWithDB creates a new SQLiteStorage instance using an existing database connection.
+// This allows sharing a SQLite database with other parts of your application.
+// The caller is responsible for closing the database connection.
+// Schema migrations will be run automatically.
+func NewWithDB(db *sql.DB, opts ...Option) (*SQLiteStorage, error) {
 	s := &SQLiteStorage{
-		dsn:          dsn,
+		db:           db,
 		lockTTL:      2 * time.Minute,
 		queryTimeout: 3 * time.Second,
 		ownerID:      uuid.New().String(),
 		locks:        make(map[string]struct{}),
+		managedDB:    false,
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
 
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
-	}
-	s.db = db
-
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-
 	ctx, cancel := context.WithTimeout(context.Background(), s.queryTimeout)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
-	if err := s.initSchema(); err != nil {
-		db.Close()
+	if err := s.initSchema(db); err != nil {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
 
 	return s, nil
 }
 
-// Close closes the database connection.
+// Close closes the database connection if it was opened by New().
+// If the storage was created with NewWithDB(), this is a no-op.
 func (s *SQLiteStorage) Close() error {
-	return s.db.Close()
+	if s.managedDB {
+		return s.db.Close()
+	}
+	return nil
 }
 
-func (s *SQLiteStorage) isMemoryDB() bool {
-	return s.dsn == ":memory:" || strings.Contains(s.dsn, "mode=memory")
-}
-
-func (s *SQLiteStorage) initSchema() error {
-	pragmas := []string{
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA busy_timeout=5000",
-	}
-	if !s.isMemoryDB() {
-		pragmas = append([]string{"PRAGMA journal_mode=WAL"}, pragmas...)
-	}
-
-	for _, p := range pragmas {
-		if _, err := s.db.Exec(p); err != nil {
-			return fmt.Errorf("%s: %w", p, err)
-		}
-	}
-
+func (s *SQLiteStorage) initSchema(db *sql.DB) error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS certmagic_data (
 		key TEXT PRIMARY KEY,
@@ -125,7 +150,7 @@ func (s *SQLiteStorage) initSchema() error {
 		owner_id TEXT NOT NULL
 	);`
 
-	_, err := s.db.Exec(schema)
+	_, err := db.Exec(schema)
 	return err
 }
 

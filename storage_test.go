@@ -2,12 +2,15 @@ package certmagicsqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io/fs"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 func newTestStorage(t *testing.T) *SQLiteStorage {
@@ -498,6 +501,57 @@ func TestMemoryDB(t *testing.T) {
 	}
 	if string(val) != "data" {
 		t.Errorf("Load returned %q, want %q", val, "data")
+	}
+}
+
+func TestNewWithDB(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "shared.db")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS app_data (id INTEGER PRIMARY KEY, value TEXT)")
+	if err != nil {
+		t.Fatalf("failed to create app table: %v", err)
+	}
+
+	s, err := NewWithDB(db)
+	if err != nil {
+		t.Fatalf("NewWithDB failed: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := s.Store(ctx, "cert/example.com", []byte("certificate data")); err != nil {
+		t.Fatalf("Store failed: %v", err)
+	}
+
+	val, err := s.Load(ctx, "cert/example.com")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if string(val) != "certificate data" {
+		t.Errorf("Load returned %q, want %q", val, "certificate data")
+	}
+
+	_, err = db.Exec("INSERT INTO app_data (value) VALUES (?)", "app value")
+	if err != nil {
+		t.Fatalf("failed to insert app data: %v", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	var count int
+	err = db.QueryRow("SELECT COUNT(*) FROM app_data").Scan(&count)
+	if err != nil {
+		t.Fatalf("DB should still be usable after storage.Close(): %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 row in app_data, got %d", count)
 	}
 }
 
