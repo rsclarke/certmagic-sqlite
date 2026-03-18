@@ -19,11 +19,11 @@ linters:
     - staticcheck
     - unconvert
     - unqueryvet
+    - gosec
     # - wrapcheck
   disable:
     # Temporarily disabled while we incrementally fix existing findings.
     - errcheck
-    - gosec
     - noctx
     - unparam
   settings:

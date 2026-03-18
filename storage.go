@@ -5,11 +5,12 @@ package certmagicsqlite
 
 import (
 	"context"
+	crand "crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
-	"math/rand"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
@@ -78,14 +79,12 @@ func New(dsn string, opts ...Option) (*SQLiteStorage, error) {
 	db.SetMaxIdleConns(1)
 
 	if err := applyPragmas(db, dsn); err != nil {
-		db.Close()
-		return nil, err
+		return nil, closeWithJoin(err, db)
 	}
 
 	s, err := NewWithDB(db, opts...)
 	if err != nil {
-		db.Close()
-		return nil, err
+		return nil, closeWithJoin(err, db)
 	}
 	s.managedDB = true
 
@@ -109,6 +108,14 @@ func applyPragmas(db *sql.DB, dsn string) error {
 		}
 	}
 	return nil
+}
+
+func closeWithJoin(baseErr error, db *sql.DB) error {
+	if closeErr := db.Close(); closeErr != nil {
+		return errors.Join(baseErr, fmt.Errorf("close database: %w", closeErr))
+	}
+
+	return baseErr
 }
 
 // NewWithDB creates a new SQLiteStorage instance using an existing database connection.
@@ -361,6 +368,19 @@ func isBusyError(err error) bool {
 		strings.Contains(errStr, "SQLITE_LOCKED")
 }
 
+func lockPollJitter(maxMillis int64) time.Duration {
+	if maxMillis <= 0 {
+		return 0
+	}
+
+	n, err := crand.Int(crand.Reader, big.NewInt(maxMillis))
+	if err != nil {
+		return 0
+	}
+
+	return time.Duration(n.Int64()) * time.Millisecond
+}
+
 // Lock acquires a named lock, blocking until the lock is acquired or
 // the context is cancelled.
 func (s *SQLiteStorage) Lock(ctx context.Context, name string) error {
@@ -385,7 +405,7 @@ func (s *SQLiteStorage) Lock(ctx context.Context, name string) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(pollInterval + time.Duration(rand.Int63n(50))*time.Millisecond):
+		case <-time.After(pollInterval + lockPollJitter(50)):
 		}
 	}
 }
