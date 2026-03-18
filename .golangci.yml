@@ -22,10 +22,8 @@ linters:
     - unconvert
     - unqueryvet
     - gosec
-    # - wrapcheck
-  disable:
-    # Temporarily disabled while we incrementally fix existing findings.
     - unparam
+    # - wrapcheck
   settings:
     errorlint:
       errorf: true
