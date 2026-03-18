@@ -23,7 +23,7 @@ linters:
     - unqueryvet
     - gosec
     - unparam
-    # - wrapcheck
+    - wrapcheck
   settings:
     errorlint:
       errorf: true

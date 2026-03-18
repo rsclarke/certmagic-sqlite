@@ -157,7 +157,9 @@ func NewWithDB(db *sql.DB, opts ...Option) (*SQLiteStorage, error) {
 // If the storage was created with NewWithDB(), this is a no-op.
 func (s *SQLiteStorage) Close() error {
 	if s.managedDB {
-		return s.db.Close()
+		if err := s.db.Close(); err != nil {
+			return fmt.Errorf("close database: %w", err)
+		}
 	}
 	return nil
 }
@@ -178,8 +180,10 @@ func (s *SQLiteStorage) initSchema(db *sql.DB) error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.queryTimeout)
 	defer cancel()
 
-	_, err := db.ExecContext(ctx, schema)
-	return err
+	if _, err := db.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("exec schema: %w", err)
+	}
+	return nil
 }
 
 func normalizeKey(key string) string {
@@ -204,14 +208,16 @@ func (s *SQLiteStorage) Store(ctx context.Context, key string, value []byte) err
 	ctx, cancel := context.WithTimeout(ctx, s.queryTimeout)
 	defer cancel()
 
-	_, err := s.db.ExecContext(ctx, `
+	if _, err := s.db.ExecContext(ctx, `
 		INSERT INTO certmagic_data(key, value, modified)
 		VALUES(?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET
 			value=excluded.value,
 			modified=excluded.modified`,
-		key, value, time.Now().UnixMilli())
-	return err
+		key, value, time.Now().UnixMilli()); err != nil {
+		return fmt.Errorf("store %q: %w", key, err)
+	}
+	return nil
 }
 
 // Load retrieves the value at the given key.
@@ -227,7 +233,10 @@ func (s *SQLiteStorage) Load(ctx context.Context, key string) ([]byte, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fs.ErrNotExist
 	}
-	return value, err
+	if err != nil {
+		return nil, fmt.Errorf("load %q: %w", key, err)
+	}
+	return value, nil
 }
 
 // Delete removes the key and all keys with the same prefix.
@@ -237,15 +246,19 @@ func (s *SQLiteStorage) Delete(ctx context.Context, key string) error {
 	defer cancel()
 
 	if key == "" {
-		_, err := s.db.ExecContext(ctx, `DELETE FROM certmagic_data`)
-		return err
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM certmagic_data`); err != nil {
+			return fmt.Errorf("delete all: %w", err)
+		}
+		return nil
 	}
 
 	start, end := prefixRange(key + "/")
-	_, err := s.db.ExecContext(ctx,
+	if _, err := s.db.ExecContext(ctx,
 		`DELETE FROM certmagic_data WHERE key = ? OR (key >= ? AND key < ?)`,
-		key, start, end)
-	return err
+		key, start, end); err != nil {
+		return fmt.Errorf("delete %q: %w", key, err)
+	}
+	return nil
 }
 
 // Exists returns true if the key exists (either as a file or prefix).
@@ -280,7 +293,7 @@ func (s *SQLiteStorage) List(ctx context.Context, prefix string, recursive bool)
 		`SELECT key FROM certmagic_data WHERE key >= ? AND key < ? ORDER BY key`,
 		start, end)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list %q: %w", prefix, err)
 	}
 	defer func() { retErr = errors.Join(retErr, rows.Close()) }()
 
@@ -290,7 +303,7 @@ func (s *SQLiteStorage) List(ctx context.Context, prefix string, recursive bool)
 	for rows.Next() {
 		var key string
 		if err := rows.Scan(&key); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("list scan: %w", err)
 		}
 
 		if recursive {
@@ -308,7 +321,7 @@ func (s *SQLiteStorage) List(ctx context.Context, prefix string, recursive bool)
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list rows: %w", err)
 	}
 	if len(results) == 0 {
 		return nil, fs.ErrNotExist
@@ -337,7 +350,7 @@ func (s *SQLiteStorage) Stat(ctx context.Context, key string) (certmagic.KeyInfo
 		}, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return certmagic.KeyInfo{}, err
+		return certmagic.KeyInfo{}, fmt.Errorf("stat %q: %w", key, err)
 	}
 
 	start, end := prefixRange(key + "/")
@@ -396,7 +409,7 @@ func (s *SQLiteStorage) Lock(ctx context.Context, name string) error {
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return fmt.Errorf("lock %q: %w", name, err)
 		}
 
 		acquired, err := s.tryLock(ctx, name)
@@ -412,7 +425,7 @@ func (s *SQLiteStorage) Lock(ctx context.Context, name string) error {
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("lock %q: %w", name, ctx.Err())
 		case <-time.After(pollInterval + lockPollJitter(50)):
 		}
 	}
@@ -436,7 +449,7 @@ func (s *SQLiteStorage) tryLock(ctx context.Context, name string) (bool, error) 
 		if isBusyError(err) {
 			return false, nil
 		}
-		return false, err
+		return false, fmt.Errorf("trylock insert %q: %w", name, err)
 	}
 
 	result, err := s.db.ExecContext(ctx,
@@ -447,7 +460,7 @@ func (s *SQLiteStorage) tryLock(ctx context.Context, name string) (bool, error) 
 		if isBusyError(err) {
 			return false, nil
 		}
-		return false, err
+		return false, fmt.Errorf("trylock update %q: %w", name, err)
 	}
 	rows, _ := result.RowsAffected()
 	return rows > 0, nil
@@ -467,7 +480,7 @@ func (s *SQLiteStorage) Unlock(ctx context.Context, name string) error {
 		`DELETE FROM certmagic_locks WHERE name = ? AND owner_id = ?`,
 		name, s.ownerID)
 	if err != nil {
-		return err
+		return fmt.Errorf("unlock %q: %w", name, err)
 	}
 
 	rows, _ := result.RowsAffected()
