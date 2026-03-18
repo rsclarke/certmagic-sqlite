@@ -382,7 +382,7 @@ func TestConcurrentStoreLoad(t *testing.T) {
 	wg.Add(goroutines)
 
 	for i := 0; i < goroutines; i++ {
-		go func(id int) {
+		go func() {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
 				key := "concurrent/key"
@@ -396,7 +396,7 @@ func TestConcurrentStoreLoad(t *testing.T) {
 					return
 				}
 			}
-		}(i)
+		}()
 	}
 
 	wg.Wait()
