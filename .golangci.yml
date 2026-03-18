@@ -4,6 +4,7 @@ linters:
     - bodyclose
     - contextcheck
     - durationcheck
+    - errcheck
     - errorlint
     - godot
     - govet
@@ -24,7 +25,6 @@ linters:
     # - wrapcheck
   disable:
     # Temporarily disabled while we incrementally fix existing findings.
-    - errcheck
     - unparam
   settings:
     errorlint:
