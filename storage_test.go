@@ -20,7 +20,11 @@ func newTestStorage(t *testing.T) *SQLiteStorage {
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("failed to close storage: %v", err)
+		}
+	})
 	return s
 }
 
@@ -331,7 +335,9 @@ func TestLockContention(t *testing.T) {
 	if err := s.Lock(ctx, lockName); err != nil {
 		t.Fatalf("Lock after unlock failed: %v", err)
 	}
-	s.Unlock(ctx, lockName)
+	if err := s.Unlock(ctx, lockName); err != nil {
+		t.Fatalf("final unlock failed: %v", err)
+	}
 }
 
 func TestLockExpiration(t *testing.T) {
@@ -356,7 +362,9 @@ func TestLockExpiration(t *testing.T) {
 	if err := s.Lock(ctx2, lockName); err != nil {
 		t.Fatalf("Lock after expiration failed: %v", err)
 	}
-	s.Unlock(ctx, lockName)
+	if err := s.Unlock(ctx, lockName); err != nil {
+		t.Fatalf("Unlock failed: %v", err)
+	}
 }
 
 func TestConcurrentStoreLoad(t *testing.T) {
@@ -583,7 +591,9 @@ func TestMillisecondTTL(t *testing.T) {
 	if err := s.Lock(ctx2, lockName); err != nil {
 		t.Fatalf("Lock after 50ms TTL expiration failed: %v", err)
 	}
-	s.Unlock(ctx, lockName)
+	if err := s.Unlock(ctx, lockName); err != nil {
+		t.Fatalf("Unlock failed: %v", err)
+	}
 }
 
 func TestWithOwnerID(t *testing.T) {
@@ -599,7 +609,9 @@ func TestWithOwnerID(t *testing.T) {
 	if err := s1.Lock(ctx, lockName); err != nil {
 		t.Fatalf("Lock failed: %v", err)
 	}
-	s1.Close()
+	if err := s1.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
 
 	s2, err := New(dbPath, WithOwnerID("instance-1"))
 	if err != nil {
@@ -614,7 +626,9 @@ func TestWithOwnerID(t *testing.T) {
 	if err := s2.Lock(ctx, lockName); err != nil {
 		t.Fatalf("Lock after unlock should succeed: %v", err)
 	}
-	s2.Unlock(ctx, lockName)
+	if err := s2.Unlock(ctx, lockName); err != nil {
+		t.Fatalf("Unlock failed: %v", err)
+	}
 }
 
 func TestWithOwnerIDDifferentOwners(t *testing.T) {
@@ -650,7 +664,9 @@ func TestWithOwnerIDDifferentOwners(t *testing.T) {
 		t.Errorf("s2 Lock should timeout, got: %v", err)
 	}
 
-	s1.Unlock(ctx, lockName)
+	if err := s1.Unlock(ctx, lockName); err != nil {
+		t.Fatalf("s1 Unlock failed: %v", err)
+	}
 }
 
 func TestStableOwnerIDAfterRestart(t *testing.T) {
@@ -668,7 +684,9 @@ func TestStableOwnerIDAfterRestart(t *testing.T) {
 	if err := s1.Lock(ctx, "lock2"); err != nil {
 		t.Fatalf("Lock 2 failed: %v", err)
 	}
-	s1.Close()
+	if err := s1.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
 
 	s2, err := New(dbPath, WithOwnerID(ownerID))
 	if err != nil {
