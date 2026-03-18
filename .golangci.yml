@@ -11,6 +11,7 @@ linters:
     - misspell
     - nilerr
     - nilnil
+    - noctx
     - nolintlint
     - predeclared
     - rowserrcheck
@@ -24,7 +25,6 @@ linters:
   disable:
     # Temporarily disabled while we incrementally fix existing findings.
     - errcheck
-    - noctx
     - unparam
   settings:
     errorlint:

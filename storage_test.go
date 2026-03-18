@@ -526,8 +526,9 @@ func TestNewWithDB(t *testing.T) {
 		t.Fatalf("failed to open database: %v", err)
 	}
 	defer db.Close()
+	ctx := context.Background()
 
-	_, err = db.Exec("CREATE TABLE IF NOT EXISTS app_data (id INTEGER PRIMARY KEY, value TEXT)")
+	_, err = db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS app_data (id INTEGER PRIMARY KEY, value TEXT)")
 	if err != nil {
 		t.Fatalf("failed to create app table: %v", err)
 	}
@@ -537,7 +538,6 @@ func TestNewWithDB(t *testing.T) {
 		t.Fatalf("NewWithDB failed: %v", err)
 	}
 
-	ctx := context.Background()
 	if err := s.Store(ctx, "cert/example.com", []byte("certificate data")); err != nil {
 		t.Fatalf("Store failed: %v", err)
 	}
@@ -550,7 +550,7 @@ func TestNewWithDB(t *testing.T) {
 		t.Errorf("Load returned %q, want %q", val, "certificate data")
 	}
 
-	_, err = db.Exec("INSERT INTO app_data (value) VALUES (?)", "app value")
+	_, err = db.ExecContext(ctx, "INSERT INTO app_data (value) VALUES (?)", "app value")
 	if err != nil {
 		t.Fatalf("failed to insert app data: %v", err)
 	}
@@ -560,7 +560,7 @@ func TestNewWithDB(t *testing.T) {
 	}
 
 	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM app_data").Scan(&count)
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM app_data").Scan(&count)
 	if err != nil {
 		t.Fatalf("DB should still be usable after storage.Close(): %v", err)
 	}
