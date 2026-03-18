@@ -20,7 +20,7 @@ jobs:
       - name: Install golangci-lint
         uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
         with:
-          args: --timeout=5m
+          install-only: true
 
       - name: Install go-task
         uses: rsclarke/install-task@7c5a961f5d0c66abcdedc332e538ef042297b928 # v1.1.0
