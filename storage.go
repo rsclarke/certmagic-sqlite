@@ -17,7 +17,7 @@ import (
 
 	"github.com/caddyserver/certmagic"
 	"github.com/google/uuid"
-	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite" // register pure-Go SQLite driver
 )
 
 var (
