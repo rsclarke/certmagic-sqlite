@@ -1,28 +1,52 @@
 version: "2"
 linters:
   enable:
+    - asciicheck
+    - bidichk
     - bodyclose
+    - canonicalheader
     - contextcheck
+    - copyloopvar
     - durationcheck
     - errcheck
+    - errchkjson
+    - errname
     - errorlint
+    - exptostd
+    - fatcontext
+    - gocheckcompilerdirectives
+    - gocritic
     - godot
     - govet
     - ineffassign
+    - intrange
+    - mirror
     - misspell
+    - modernize
+    - nakedret
     - nilerr
+    - nilnesserr
     - nilnil
     - noctx
     - nolintlint
+    - nosprintfhostport
+    - perfsprint
     - predeclared
-    - rowserrcheck
+    - reassign
+    - recvcheck
     - revive
+    - rowserrcheck
     - sqlclosecheck
     - staticcheck
+    - thelper
     - unconvert
-    - unqueryvet
-    - gosec
     - unparam
+    - unqueryvet
+    - unused
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - gosec
     - wrapcheck
   settings:
     errorlint:
