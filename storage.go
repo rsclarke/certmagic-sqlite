@@ -25,6 +25,8 @@ var (
 	_ certmagic.Locker  = (*SQLiteStorage)(nil)
 )
 
+const defaultQueryTimeout = 3 * time.Second
+
 // SQLiteStorage implements certmagic.Storage and certmagic.Locker
 // using a SQLite database for persistence.
 type SQLiteStorage struct {
@@ -102,8 +104,11 @@ func applyPragmas(db *sql.DB, dsn string) error {
 		pragmas = append([]string{"PRAGMA journal_mode=WAL"}, pragmas...)
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), defaultQueryTimeout)
+	defer cancel()
+
 	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
+		if _, err := db.ExecContext(ctx, p); err != nil {
 			return fmt.Errorf("%s: %w", p, err)
 		}
 	}
@@ -126,7 +131,7 @@ func NewWithDB(db *sql.DB, opts ...Option) (*SQLiteStorage, error) {
 	s := &SQLiteStorage{
 		db:           db,
 		lockTTL:      2 * time.Minute,
-		queryTimeout: 3 * time.Second,
+		queryTimeout: defaultQueryTimeout,
 		ownerID:      uuid.New().String(),
 		locks:        make(map[string]struct{}),
 		managedDB:    false,
@@ -170,7 +175,10 @@ func (s *SQLiteStorage) initSchema(db *sql.DB) error {
 		owner_id TEXT NOT NULL
 	);`
 
-	_, err := db.Exec(schema)
+	ctx, cancel := context.WithTimeout(context.Background(), s.queryTimeout)
+	defer cancel()
+
+	_, err := db.ExecContext(ctx, schema)
 	return err
 }
 
