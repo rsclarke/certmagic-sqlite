@@ -265,7 +265,7 @@ func (s *SQLiteStorage) Exists(ctx context.Context, key string) bool {
 // List returns all keys with the given prefix.
 // If recursive is false, only direct children are returned.
 // Returns fs.ErrNotExist if no keys match.
-func (s *SQLiteStorage) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
+func (s *SQLiteStorage) List(ctx context.Context, prefix string, recursive bool) (_ []string, retErr error) {
 	prefix = normalizeKey(prefix)
 	ctx, cancel := context.WithTimeout(ctx, s.queryTimeout)
 	defer cancel()
@@ -282,7 +282,7 @@ func (s *SQLiteStorage) List(ctx context.Context, prefix string, recursive bool)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { retErr = errors.Join(retErr, rows.Close()) }()
 
 	seen := make(map[string]struct{})
 	var results []string

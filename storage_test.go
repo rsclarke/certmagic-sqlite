@@ -346,7 +346,11 @@ func TestLockExpiration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("failed to close storage: %v", err)
+		}
+	}()
 
 	ctx := context.Background()
 	lockName := "expiring-lock"
@@ -456,13 +460,21 @@ func TestLockOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create storage 1: %v", err)
 	}
-	defer s1.Close()
+	defer func() {
+		if err := s1.Close(); err != nil {
+			t.Errorf("failed to close storage 1: %v", err)
+		}
+	}()
 
 	s2, err := New(dbPath, WithLockTTL(100*time.Millisecond))
 	if err != nil {
 		t.Fatalf("failed to create storage 2: %v", err)
 	}
-	defer s2.Close()
+	defer func() {
+		if err := s2.Close(); err != nil {
+			t.Errorf("failed to close storage 2: %v", err)
+		}
+	}()
 
 	ctx := context.Background()
 	lockName := "ownership-lock"
@@ -502,7 +514,11 @@ func TestMemoryDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create in-memory storage: %v", err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("failed to close storage: %v", err)
+		}
+	}()
 
 	ctx := context.Background()
 	if err := s.Store(ctx, "test", []byte("data")); err != nil {
@@ -525,7 +541,11 @@ func TestNewWithDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("failed to close database: %v", err)
+		}
+	}()
 	ctx := context.Background()
 
 	_, err = db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS app_data (id INTEGER PRIMARY KEY, value TEXT)")
@@ -575,7 +595,11 @@ func TestMillisecondTTL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("failed to close storage: %v", err)
+		}
+	}()
 
 	ctx := context.Background()
 	lockName := "ms-ttl-lock"
@@ -617,7 +641,11 @@ func TestWithOwnerID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to recreate storage: %v", err)
 	}
-	defer s2.Close()
+	defer func() {
+		if err := s2.Close(); err != nil {
+			t.Errorf("failed to close storage: %v", err)
+		}
+	}()
 
 	if err := s2.Unlock(ctx, lockName); err != nil {
 		t.Fatalf("Unlock with same ownerID should succeed: %v", err)
@@ -640,13 +668,21 @@ func TestWithOwnerIDDifferentOwners(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create storage 1: %v", err)
 	}
-	defer s1.Close()
+	defer func() {
+		if err := s1.Close(); err != nil {
+			t.Errorf("failed to close storage 1: %v", err)
+		}
+	}()
 
 	s2, err := New(dbPath, WithOwnerID("instance-2"), WithLockTTL(time.Minute))
 	if err != nil {
 		t.Fatalf("failed to create storage 2: %v", err)
 	}
-	defer s2.Close()
+	defer func() {
+		if err := s2.Close(); err != nil {
+			t.Errorf("failed to close storage 2: %v", err)
+		}
+	}()
 
 	if err := s1.Lock(ctx, lockName); err != nil {
 		t.Fatalf("s1 Lock failed: %v", err)
@@ -692,7 +728,11 @@ func TestStableOwnerIDAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to recreate storage: %v", err)
 	}
-	defer s2.Close()
+	defer func() {
+		if err := s2.Close(); err != nil {
+			t.Errorf("failed to close storage: %v", err)
+		}
+	}()
 
 	if err := s2.Unlock(ctx, "lock1"); err != nil {
 		t.Fatalf("Unlock lock1 after restart failed: %v", err)
