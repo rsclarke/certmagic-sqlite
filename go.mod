@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/caddyserver/certmagic v0.25.3
 	github.com/google/uuid v1.6.0
-	modernc.org/sqlite v1.50.1
+	modernc.org/sqlite v1.51.0
 )
 
 require (
