@@ -123,6 +123,16 @@ tasks:
     cmds:
       - golangci-lint run --fix
 
+  zizmor:
+    desc: Run zizmor
+    cmds:
+      - zizmor --strict-collection .
+
+  zizmor:fix:
+    desc: Run zizmor with safe automatic fixes
+    cmds:
+      - zizmor --fix=safe --strict-collection .
+
   test:
     desc: Run tests
     cmds:
