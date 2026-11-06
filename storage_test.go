@@ -13,10 +13,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func newTestStorage(t *testing.T) *SQLiteStorage {
+func newTestStorage(t *testing.T, opts ...Option) *SQLiteStorage {
 	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "test.db")
-	s, err := New(dbPath)
+	s, err := New(":memory:", opts...)
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
@@ -341,16 +340,7 @@ func TestLockContention(t *testing.T) {
 }
 
 func TestLockExpiration(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "test.db")
-	s, err := New(dbPath, WithLockTTL(100*time.Millisecond))
-	if err != nil {
-		t.Fatalf("failed to create storage: %v", err)
-	}
-	defer func() {
-		if err := s.Close(); err != nil {
-			t.Errorf("failed to close storage: %v", err)
-		}
-	}()
+	s := newTestStorage(t, WithLockTTL(100*time.Millisecond))
 
 	ctx := context.Background()
 	lockName := "expiring-lock"
@@ -535,12 +525,13 @@ func TestMemoryDB(t *testing.T) {
 }
 
 func TestNewWithDB(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "shared.db")
-
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
+	// A private in-memory database belongs to one connection; keep it alive.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	defer func() {
 		if err := db.Close(); err != nil {
 			t.Errorf("failed to close database: %v", err)
@@ -590,16 +581,7 @@ func TestNewWithDB(t *testing.T) {
 }
 
 func TestMillisecondTTL(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "test.db")
-	s, err := New(dbPath, WithLockTTL(50*time.Millisecond))
-	if err != nil {
-		t.Fatalf("failed to create storage: %v", err)
-	}
-	defer func() {
-		if err := s.Close(); err != nil {
-			t.Errorf("failed to close storage: %v", err)
-		}
-	}()
+	s := newTestStorage(t, WithLockTTL(50*time.Millisecond))
 
 	ctx := context.Background()
 	lockName := "ms-ttl-lock"
