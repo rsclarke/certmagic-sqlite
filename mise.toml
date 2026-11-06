@@ -1,0 +1,5 @@
+[tools]
+go = "1.25.14"
+task = "3.54.0"
+golangci-lint = "2.15.0"
+zizmor = "1.32.0"

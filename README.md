@@ -222,3 +222,14 @@ These tables coexist safely with your application tables.
 - Distributed locking across multiple servers
 
 SQLite storage provides the same single-node guarantees as the default filesystem storage, with added benefits of atomic transactions and single-file backup.
+
+## Development
+
+Tool versions are pinned in `mise.toml`. Install [mise](https://mise.jdx.dev/),
+configure its [shell activation](https://mise.jdx.dev/shell-setup.html), then run
+`mise install --locked` from the repository root. When updating tool versions,
+regenerate `mise.lock` with `mise lock` and commit both files.
+
+- `task ci` — lint and test
+- `task test` — run tests only
+- `task zizmor` — audit GitHub Actions
