@@ -17,25 +17,10 @@ echo "mise ready after ${SECONDS}s"
 
 echo "Installing pinned development tools"
 "$mise" trust "$repo_root/mise.toml"
+"$mise" settings set shims_dir "$HOME/.local/bin"
 "$mise" install --locked
+"$mise" reshim
 echo "Tools ready after ${SECONDS}s"
-
-# Amp and supervised services start in non-interactive login shells.
-profile_marker="# certmagic-sqlite mise environment: $repo_root"
-if ! grep -Fqx -- "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
-  cat >> "$HOME/.bash_profile" <<EOF
-
-$profile_marker
-if [[ -z "\${CERTMAGIC_SQLITE_MISE_ACTIVE:-}" ]]; then
-  case "\$PWD" in
-    "$repo_root"|"$repo_root"/*)
-      eval "\$("$mise" env --shell bash)"
-      export CERTMAGIC_SQLITE_MISE_ACTIVE=1
-      ;;
-  esac
-fi
-EOF
-fi
 
 echo "Downloading Go modules and warming the test/build cache"
 "$mise" exec -- go mod download
