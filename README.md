@@ -89,6 +89,12 @@ func main() {
 }
 ```
 
+### File Permissions
+
+The database and WAL can contain certificate and account private keys. On Unix, use a service-owned containing directory with mode `0700` and a database with mode `0600`. SQLite creates the `-wal` and `-shm` files itself, normally using the database's permissions. Secure the directory before opening the database, and keep parent directories protected from untrusted writes; use equivalent ACL restrictions on other platforms.
+
+Neither constructor enforces these permissions. Set umask `077` before starting the application to restrict newly created files. This does not tighten existing files: stop all database users before correcting their ownership and permissions. These requirements also apply to the entire shared database when using `NewWithDB()`.
+
 ## Configuration Options
 
 Both constructors accept functional options:
