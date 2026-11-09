@@ -136,7 +136,7 @@ tasks:
   test:
     desc: Run tests
     cmds:
-      - go test ./...
+      - go test -race ./...
 
   ci:
     desc: Run lint and test checks

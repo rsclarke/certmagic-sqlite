@@ -8,7 +8,7 @@ A SQLite storage backend for [CertMagic](https://github.com/caddyserver/certmagi
 - Pure Go SQLite driver ([modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite)) — no CGO
 - Supports shared database connections for applications already using SQLite
 - Automatic schema migrations
-- Distributed locking with expiration-based stale lock detection
+- Automatically refreshed locks with expiration-based crash recovery
 
 ## Installation
 
@@ -83,7 +83,7 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
-    defer storage.Close() // No-op; doesn't close the shared db
+    defer storage.Close() // Ends the storage lifecycle; doesn't close the shared db
 
     certmagic.Default.Storage = storage
 }
@@ -95,36 +95,26 @@ Both constructors accept functional options:
 
 ```go
 storage, err := certmagicsqlite.New("/path/to/certs.db",
-    certmagicsqlite.WithLockTTL(5*time.Minute),      // Lock expiration (default: 2 minutes)
+    certmagicsqlite.WithLockTTL(5*time.Minute),       // Time allowed since last refresh (default: 2 minutes)
+    certmagicsqlite.WithRefreshInterval(time.Minute), // Refresh interval (default: TTL / 3)
     certmagicsqlite.WithQueryTimeout(10*time.Second), // Query timeout (default: 3 seconds)
 )
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithLockTTL(d)` | 2 minutes | Duration after which locks expire and can be stolen |
-| `WithQueryTimeout(d)` | 3 seconds | Timeout for individual database queries |
-| `WithOwnerID(id)` | Random UUID | Identifier for lock ownership (see below) |
+| `WithLockTTL(d)` | 2 minutes | Lease duration after each refresh; must be at least 1 ms |
+| `WithRefreshInterval(d)` | TTL / 3 | Time between lock refresh attempts; must be positive and below TTL |
+| `WithQueryTimeout(d)` | 3 seconds | Timeout for individual database queries; must be positive |
+| `WithOwnerID(id)` | Random UUID | Instance label for identifying lock records |
 
-### Lock Owner ID
+### Locking
 
-By default, a random UUID is generated each time the storage is created. This means after a restart, the application cannot clean up its own stale locks — it must wait for them to expire.
+CertMagic handles locking automatically to coordinate certificate work between processes sharing the same SQLite database. The driver refreshes active locks and lets abandoned locks expire after a crash. `WithLockTTL` controls how long a lock remains valid without a successful refresh; allow enough time for scheduling and database delays. A pause or outage longer than this can allow overlapping certificate work.
 
-For faster recovery after restarts, provide a stable owner ID:
+Lock owners get random UUID labels by default. Set `WithOwnerID` to a hostname or application instance name for easier identification in database records. This is only a label, not a way to reclaim locks after a restart.
 
-```go
-import "os"
-
-hostname, _ := os.Hostname()
-storage, err := certmagicsqlite.New("/path/to/certs.db",
-    certmagicsqlite.WithOwnerID(hostname),
-)
-```
-
-| Deployment | Recommended ownerID |
-|------------|---------------------|
-| Single instance | Hostname or fixed string |
-| Multiple instances | Unique per instance (hostname, pod name, etc.) |
+When upgrading from a version without automatic lock refresh, stop all processes sharing the database before starting the new version.
 
 ## Recommended SQLite Settings for `NewWithDB`
 
@@ -231,5 +221,5 @@ configure its [shell activation](https://mise.jdx.dev/shell-setup.html), then ru
 regenerate `mise.lock` with `mise lock` and commit both files.
 
 - `task ci` — lint and test
-- `task test` — run tests only
+- `task test` — run tests with the Go race detector (requires a supported CGO-enabled toolchain; the SQLite driver itself remains pure Go)
 - `task zizmor` — audit GitHub Actions
