@@ -7,7 +7,7 @@ A SQLite storage backend for [CertMagic](https://github.com/caddyserver/certmagi
 - Implements `certmagic.Storage` and `certmagic.Locker` interfaces
 - Pure Go SQLite driver ([modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite)) — no CGO
 - Supports shared database connections for applications already using SQLite
-- Automatic schema migrations
+- Automatic creation of storage tables
 - Automatically refreshed locks with expiration-based crash recovery
 
 ## Installation
@@ -45,7 +45,7 @@ func main() {
 
 `New()` automatically configures:
 - WAL journal mode (for better concurrency)
-- `synchronous=NORMAL` (safe balance of durability and performance)
+- `synchronous=NORMAL` (recent commits can be lost after power loss; see below)
 - `busy_timeout=5000` (5 second wait on lock contention)
 
 ### Shared Database
@@ -64,21 +64,20 @@ import (
 )
 
 func main() {
-    // Open your application database
-    db, err := sql.Open("sqlite", "/path/to/app.db")
+    // Open your application database with a busy timeout on every connection
+    db, err := sql.Open("sqlite", "/path/to/app.db?_pragma=busy_timeout(5000)")
     if err != nil {
         log.Fatal(err)
     }
     defer db.Close()
 
-    // Configure recommended PRAGMAs (see below)
+    // Enable WAL (see recommended settings below)
     db.Exec("PRAGMA journal_mode=WAL")
-    db.Exec("PRAGMA busy_timeout=5000")
 
     // Create your application tables
     db.Exec("CREATE TABLE IF NOT EXISTS users (...)")
 
-    // Create CertMagic storage (runs schema migrations automatically)
+    // Create CertMagic storage (creates missing storage tables)
     storage, err := certmagicsqlite.NewWithDB(db)
     if err != nil {
         log.Fatal(err)
@@ -130,7 +129,7 @@ When upgrading from a version without automatic lock refresh, stop all processes
 
 ## Recommended SQLite Settings for `NewWithDB`
 
-When using `NewWithDB()`, you are responsible for configuring the database connection. Here are the recommended settings:
+`NewWithDB()` does not configure the database or connection pool. You are responsible for these settings. `busy_timeout` and `synchronous` apply per connection; use the driver's `_pragma` DSN parameters to set them on every connection, including replacements, as shown in the complete example below.
 
 ### Journal Mode: WAL
 
@@ -143,7 +142,7 @@ WAL (Write-Ahead Logging) provides:
 - Improved performance for mixed read/write workloads
 - Crash resilience
 
-**Note:** WAL is not supported for `:memory:` databases.
+**Note:** WAL requires all database users to be on the same host and does not work over network filesystems. WAL is not supported for `:memory:` databases; each connection to `:memory:` has its own private database.
 
 ### Busy Timeout
 
@@ -160,32 +159,30 @@ db.Exec("PRAGMA synchronous=NORMAL")
 ```
 
 Options:
-- `FULL` (default): Safest, slowest — syncs after every transaction
-- `NORMAL`: Safe with WAL — syncs less frequently, good performance
+- `FULL` (SQLite default): In WAL mode, syncs each commit for power-loss durability
+- `NORMAL`: In WAL mode, preserves database consistency, but recent commits can be lost after an OS crash or power loss
 - `OFF`: Fastest, but risks corruption on power loss
 
-`NORMAL` is recommended when using WAL mode.
+`New()` uses `NORMAL`. Use `FULL` when acknowledged writes must survive power loss. See [SQLite's synchronous documentation](https://www.sqlite.org/pragma.html#pragma_synchronous).
 
 ### Connection Pool Settings
 
 ```go
-db.SetMaxOpenConns(1)  // Serialize all writes
+db.SetMaxOpenConns(1)  // Serialize access through this pool
 db.SetMaxIdleConns(1)  // Keep connection warm
 ```
 
-SQLite only supports one writer at a time. Setting `MaxOpenConns(1)` prevents "database is locked" errors by serializing access at the Go level.
+SQLite only supports one writer at a time. `MaxOpenConns(1)` serializes access through this pool, but other pools or processes can still cause "database is locked" errors.
 
 ### Complete Example
 
 ```go
-db, _ := sql.Open("sqlite", "/path/to/app.db")
+db, _ := sql.Open("sqlite", "/path/to/app.db?_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
 
 // Recommended settings
 db.SetMaxOpenConns(1)
 db.SetMaxIdleConns(1)
 db.Exec("PRAGMA journal_mode=WAL")
-db.Exec("PRAGMA synchronous=NORMAL")
-db.Exec("PRAGMA busy_timeout=5000")
 
 storage, _ := certmagicsqlite.NewWithDB(db)
 ```
@@ -208,7 +205,7 @@ CREATE TABLE IF NOT EXISTS certmagic_locks (
 );
 ```
 
-These tables coexist safely with your application tables.
+These tables coexist with your application tables. Initialization creates missing tables; it does not migrate existing schemas.
 
 ## When to Use SQLite vs Other Backends
 
@@ -223,7 +220,9 @@ These tables coexist safely with your application tables.
 - High-availability deployments
 - Distributed locking across multiple servers
 
-SQLite storage provides the same single-node guarantees as the default filesystem storage, with added benefits of atomic transactions and single-file backup.
+Individual storage writes and deletes are atomic; CertMagic's multi-key certificate updates are not a single transaction.
+
+For continuous SQLite backups, consider [Litestream](https://litestream.io/).
 
 ## Development
 

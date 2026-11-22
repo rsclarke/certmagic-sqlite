@@ -151,7 +151,7 @@ func closeWithJoin(baseErr error, db *sql.DB) error {
 // NewWithDB creates a new SQLiteStorage instance using an existing database connection.
 // This allows sharing a SQLite database with other parts of your application.
 // The caller is responsible for closing the database connection.
-// Schema migrations will be run automatically.
+// Missing storage tables are created automatically; existing schemas are not migrated.
 func NewWithDB(db *sql.DB, opts ...Option) (*SQLiteStorage, error) {
 	s := &SQLiteStorage{
 		db:           db,
