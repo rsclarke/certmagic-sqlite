@@ -95,6 +95,12 @@ The database and WAL can contain certificate and account private keys. On Unix, 
 
 Neither constructor enforces these permissions. Set umask `077` before starting the application to restrict newly created files. This does not tighten existing files: stop all database users before correcting their ownership and permissions. These requirements also apply to the entire shared database when using `NewWithDB()`.
 
+## Storage Keys
+
+CertMagic manages storage keys automatically, so normal use requires no key configuration.
+
+For direct use, keys follow slash-separated paths, with directories inferred from stored keys. The empty key `""` is a virtual root that exists even when storage is empty. `Store` and `Load` reject it with an error matching `fs.ErrInvalid`. **`Delete("")` clears all stored data**, preserving the schema and locks.
+
 ## Configuration Options
 
 Both constructors accept functional options:
@@ -228,4 +234,5 @@ regenerate `mise.lock` with `mise lock` and commit both files.
 
 - `task ci` — lint and test
 - `task test` — run tests with the Go race detector (requires a supported CGO-enabled toolchain; the SQLite driver itself remains pure Go)
+- `go test -run '^$' -fuzz '^FuzzPathOperations$' -fuzztime=2m ./...` — fuzz storage operation sequences against an independent path model
 - `task zizmor` — audit GitHub Actions

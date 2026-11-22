@@ -248,16 +248,23 @@ func normalizeKey(key string) string {
 	return key
 }
 
-func prefixRange(prefix string) (string, string) {
-	if prefix == "" {
-		return "", "\uffff"
+// descendantRange bounds the literal component prefix under SQLite's default
+// BINARY collation: '/' is immediately before '0', regardless of the suffix.
+// An empty start denotes the virtual root and requires an unbounded query.
+func descendantRange(key string) (string, string) {
+	if key == "" {
+		return "", ""
 	}
-	return prefix, prefix + "\uffff"
+	return key + "/", key + "0"
 }
 
-// Store saves the value at the given key.
+// Store saves the value at the exact key. An empty normalized key is reserved
+// for the virtual root and returns an error wrapping fs.ErrInvalid.
 func (s *SQLiteStorage) Store(ctx context.Context, key string, value []byte) error {
 	key = normalizeKey(key)
+	if key == "" {
+		return fmt.Errorf("store %q: empty key: %w", key, fs.ErrInvalid)
+	}
 	ctx, cancel := context.WithTimeout(ctx, s.queryTimeout)
 	defer cancel()
 
@@ -273,10 +280,14 @@ func (s *SQLiteStorage) Store(ctx context.Context, key string, value []byte) err
 	return nil
 }
 
-// Load retrieves the value at the given key.
+// Load retrieves the value at the exact key. An empty normalized key returns
+// an error wrapping fs.ErrInvalid because the virtual root is not a file.
 // Returns fs.ErrNotExist if the key does not exist.
 func (s *SQLiteStorage) Load(ctx context.Context, key string) ([]byte, error) {
 	key = normalizeKey(key)
+	if key == "" {
+		return nil, fmt.Errorf("load %q: empty key: %w", key, fs.ErrInvalid)
+	}
 	ctx, cancel := context.WithTimeout(ctx, s.queryTimeout)
 	defer cancel()
 
@@ -292,7 +303,8 @@ func (s *SQLiteStorage) Load(ctx context.Context, key string) ([]byte, error) {
 	return value, nil
 }
 
-// Delete removes the key and all keys with the same prefix.
+// Delete atomically removes the exact key and its component descendants.
+// The empty key clears data, preserving the schema, locks, and virtual root.
 func (s *SQLiteStorage) Delete(ctx context.Context, key string) error {
 	key = normalizeKey(key)
 	ctx, cancel := context.WithTimeout(ctx, s.queryTimeout)
@@ -305,7 +317,7 @@ func (s *SQLiteStorage) Delete(ctx context.Context, key string) error {
 		return nil
 	}
 
-	start, end := prefixRange(key + "/")
+	start, end := descendantRange(key)
 	if _, err := s.db.ExecContext(ctx,
 		`DELETE FROM certmagic_data WHERE key = ? OR (key >= ? AND key < ?)`,
 		key, start, end); err != nil {
@@ -314,37 +326,47 @@ func (s *SQLiteStorage) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// Exists returns true if the key exists (either as a file or prefix).
+// Exists returns true if the key exists as a file, implicit directory, or the
+// virtual root (empty key). Any database or context error returns false.
 func (s *SQLiteStorage) Exists(ctx context.Context, key string) bool {
 	key = normalizeKey(key)
 	ctx, cancel := context.WithTimeout(ctx, s.queryTimeout)
 	defer cancel()
 
-	start, end := prefixRange(key + "/")
-	var exists int
+	start, end := descendantRange(key)
+	var exists bool
 	err := s.db.QueryRowContext(ctx,
-		`SELECT 1 FROM certmagic_data WHERE key = ? OR (key >= ? AND key < ?) LIMIT 1`,
-		key, start, end).Scan(&exists)
-	return err == nil
+		`SELECT EXISTS(SELECT 1 FROM certmagic_data WHERE key = ? OR (key >= ? AND key < ?)) OR ? = ''`,
+		key, start, end, key).Scan(&exists)
+	return err == nil && ctx.Err() == nil && exists
 }
 
-// List returns all keys with the given prefix.
-// If recursive is false, only direct children are returned.
-// Returns fs.ErrNotExist if no keys match.
+// List returns children of the given path, excluding the path itself.
+// Recursive listings include implicit directories as well as terminal keys;
+// otherwise only direct children are returned. Existing files and an empty
+// virtual root list successfully with no children. Missing paths return
+// fs.ErrNotExist.
 func (s *SQLiteStorage) List(ctx context.Context, prefix string, recursive bool) (_ []string, retErr error) {
 	prefix = normalizeKey(prefix)
 	ctx, cancel := context.WithTimeout(ctx, s.queryTimeout)
 	defer cancel()
 
-	prefixDir := prefix
-	if prefixDir != "" && !strings.HasSuffix(prefixDir, "/") {
-		prefixDir += "/"
+	// Preserve List's existing acceptance of a trailing slash.
+	start, end := descendantRange(strings.TrimSuffix(prefix, "/"))
+	if prefix == "/" {
+		// Repeated leading separators normalize to a literal slash prefix,
+		// not the virtual root. Bound that prefix without trimming it away.
+		start, end = "/", "0"
 	}
-
-	start, end := prefixRange(prefixDir)
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT key FROM certmagic_data WHERE key >= ? AND key < ? ORDER BY key`,
-		start, end)
+	var rows *sql.Rows
+	var err error
+	if prefix == "" {
+		rows, err = s.db.QueryContext(ctx, `SELECT key FROM certmagic_data ORDER BY key`)
+	} else {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT key FROM certmagic_data WHERE key = ? OR (key >= ? AND key < ?) ORDER BY key`,
+			prefix, start, end)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("list %q: %w", prefix, err)
 	}
@@ -352,6 +374,7 @@ func (s *SQLiteStorage) List(ctx context.Context, prefix string, recursive bool)
 
 	seen := make(map[string]struct{})
 	var results []string
+	exists := prefix == ""
 
 	for rows.Next() {
 		var key string
@@ -359,30 +382,36 @@ func (s *SQLiteStorage) List(ctx context.Context, prefix string, recursive bool)
 			return nil, fmt.Errorf("list scan: %w", err)
 		}
 
-		if recursive {
-			results = append(results, key)
-		} else {
-			rest := strings.TrimPrefix(key, prefixDir)
-			if idx := strings.Index(rest, "/"); idx != -1 {
-				rest = rest[:idx]
+		exists = true
+		if key == prefix {
+			continue
+		}
+		dir, rest := start, strings.TrimPrefix(key, start)
+		for {
+			component, remaining, hasMore := strings.Cut(rest, "/")
+			child := dir + component
+			if _, ok := seen[child]; !ok && child != prefix {
+				seen[child] = struct{}{}
+				results = append(results, child)
 			}
-			if _, ok := seen[rest]; !ok {
-				seen[rest] = struct{}{}
-				results = append(results, prefixDir+rest)
+			if !recursive || !hasMore {
+				break
 			}
+			dir, rest = child+"/", remaining
 		}
 	}
 
-	if err := rows.Err(); err != nil {
+	if err := errors.Join(rows.Err(), ctx.Err()); err != nil {
 		return nil, fmt.Errorf("list rows: %w", err)
 	}
-	if len(results) == 0 {
+	if !exists {
 		return nil, fs.ErrNotExist
 	}
 	return results, nil
 }
 
-// Stat returns information about the key.
+// Stat returns information about the exact key or an implicit directory.
+// The empty key is always a directory in initialized, accessible storage.
 // Returns fs.ErrNotExist if the key does not exist.
 func (s *SQLiteStorage) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
 	key = normalizeKey(key)
@@ -392,8 +421,9 @@ func (s *SQLiteStorage) Stat(ctx context.Context, key string) (certmagic.KeyInfo
 	var size int64
 	var modified int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT LENGTH(value), modified FROM certmagic_data WHERE key = ?`, key).
+		`SELECT LENGTH(value), modified FROM certmagic_data WHERE key = ? AND key <> ''`, key).
 		Scan(&size, &modified)
+	err = errors.Join(err, ctx.Err())
 	if err == nil {
 		return certmagic.KeyInfo{
 			Key:        key,
@@ -406,20 +436,32 @@ func (s *SQLiteStorage) Stat(ctx context.Context, key string) (certmagic.KeyInfo
 		return certmagic.KeyInfo{}, fmt.Errorf("stat %q: %w", key, err)
 	}
 
-	start, end := prefixRange(key + "/")
-	err = s.db.QueryRowContext(ctx,
-		`SELECT MAX(modified) FROM certmagic_data WHERE key >= ? AND key < ?`,
-		start, end).Scan(&modified)
-	if err != nil || modified == 0 {
+	start, end := descendantRange(key)
+	var directoryModified sql.NullInt64
+	if start == "" {
+		err = s.db.QueryRowContext(ctx, `SELECT MAX(modified) FROM certmagic_data WHERE key <> ''`).Scan(&directoryModified)
+	} else {
+		err = s.db.QueryRowContext(ctx,
+			`SELECT MAX(modified) FROM certmagic_data WHERE key >= ? AND key < ?`,
+			start, end).Scan(&directoryModified)
+	}
+	err = errors.Join(err, ctx.Err())
+	if err != nil {
+		return certmagic.KeyInfo{}, fmt.Errorf("stat directory %q: %w", key, err)
+	}
+	if !directoryModified.Valid && key != "" {
 		return certmagic.KeyInfo{}, fs.ErrNotExist
 	}
 
-	return certmagic.KeyInfo{
+	info := certmagic.KeyInfo{
 		Key:        key,
-		Modified:   time.UnixMilli(modified),
 		Size:       0,
 		IsTerminal: false,
-	}, nil
+	}
+	if directoryModified.Valid {
+		info.Modified = time.UnixMilli(directoryModified.Int64)
+	}
+	return info, nil
 }
 
 func isBusyError(err error) bool {

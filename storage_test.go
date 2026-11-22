@@ -14,10 +14,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +28,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/certmagic"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"modernc.org/sqlite"
 )
@@ -260,11 +264,11 @@ func TestListRecursive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List failed: %v", err)
 	}
-	if len(list) != 3 {
-		t.Errorf("List returned %d items, want 3: %v", len(list), list)
+	if len(list) != 4 {
+		t.Errorf("List returned %d items, want 4: %v", len(list), list)
 	}
 
-	expected := map[string]bool{"a/b/c": true, "a/b/d": true, "a/x": true}
+	expected := map[string]bool{"a/b": true, "a/b/c": true, "a/b/d": true, "a/x": true}
 	for _, k := range list {
 		if !expected[k] {
 			t.Errorf("unexpected key in list: %s", k)
@@ -306,6 +310,747 @@ func TestListNotExist(t *testing.T) {
 	_, err := s.List(ctx, "nonexistent", true)
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("List returned %v, want fs.ErrNotExist", err)
+	}
+}
+
+// Compare the portable path contract with the FileStorage version pinned in
+// go.mod. Root lifetime, normalization, and retained empty directories differ
+// between backends and are deliberately tested separately.
+func TestPathConformance(t *testing.T) {
+	for _, backend := range []string{"sqlite", "filestorage"} {
+		t.Run(backend, func(t *testing.T) {
+			var s certmagic.Storage
+			if backend == "sqlite" {
+				s = newTestStorage(t)
+			} else {
+				s = &certmagic.FileStorage{Path: t.TempDir()}
+			}
+			ctx := t.Context()
+			leaves := []string{
+				"leaf", "a/b/c", "a/b/d", "a/b/\uffff", "a/b/😀", "a/x",
+				"ab/y", "a0/neighbor", "A/other", "u/\uffff", "v/😀",
+				"\uffff/child", "😀/child", "p%_/child", "pZZ/neighbor",
+			}
+			for _, key := range leaves {
+				if err := s.Store(ctx, key, []byte("value:"+key)); err != nil {
+					t.Fatal(err)
+				}
+				value, err := s.Load(ctx, key)
+				if err != nil || string(value) != "value:"+key {
+					t.Fatalf("Load(%q) = %q, %v", key, value, err)
+				}
+			}
+			if err := s.Store(ctx, "leaf", []byte("replacement")); err != nil {
+				t.Fatal(err)
+			}
+			value, err := s.Load(ctx, "leaf")
+			if err != nil || string(value) != "replacement" {
+				t.Fatalf("overwrite Load = %q, %v", value, err)
+			}
+
+			for _, tc := range []struct {
+				key       string
+				exists    bool
+				terminal  bool
+				direct    []string
+				recursive []string
+			}{
+				{key: "leaf", exists: true, terminal: true},
+				{key: "a/b/c", exists: true, terminal: true},
+				{key: "a/x", exists: true, terminal: true},
+				{key: "a/b/\uffff", exists: true, terminal: true},
+				{key: "a/b/😀", exists: true, terminal: true},
+				{
+					key: "a", exists: true,
+					direct:    []string{"a/b", "a/x"},
+					recursive: []string{"a/b", "a/b/c", "a/b/d", "a/b/\uffff", "a/b/😀", "a/x"},
+				},
+				{
+					key: "a/b", exists: true,
+					direct:    []string{"a/b/c", "a/b/d", "a/b/\uffff", "a/b/😀"},
+					recursive: []string{"a/b/c", "a/b/d", "a/b/\uffff", "a/b/😀"},
+				},
+				{key: "ab", exists: true, direct: []string{"ab/y"}, recursive: []string{"ab/y"}},
+				{key: "u", exists: true, direct: []string{"u/\uffff"}, recursive: []string{"u/\uffff"}},
+				{key: "v", exists: true, direct: []string{"v/😀"}, recursive: []string{"v/😀"}},
+				{key: "\uffff", exists: true, direct: []string{"\uffff/child"}, recursive: []string{"\uffff/child"}},
+				{key: "😀", exists: true, direct: []string{"😀/child"}, recursive: []string{"😀/child"}},
+				{key: "p%_", exists: true, direct: []string{"p%_/child"}, recursive: []string{"p%_/child"}},
+				{key: "missing"},
+				{key: "a/bb"},
+				{key: "p%"},
+				{key: "a/b/😀x"},
+				{key: "\uffffx"},
+				{key: "😀x"},
+			} {
+				t.Run(tc.key, func(t *testing.T) {
+					if got := s.Exists(ctx, tc.key); got != tc.exists {
+						t.Errorf("Exists = %t, want %t", got, tc.exists)
+					}
+					info, err := s.Stat(ctx, tc.key)
+					if !tc.exists {
+						if !errors.Is(err, fs.ErrNotExist) {
+							t.Errorf("Stat = %v, want not-exist", err)
+						}
+					} else if err != nil || info.Key != tc.key || info.IsTerminal != tc.terminal {
+						t.Errorf("Stat = %+v, %v; want terminal=%t", info, err, tc.terminal)
+					}
+					if !tc.terminal {
+						_, err := s.Load(ctx, tc.key)
+						if err == nil || (!tc.exists && !errors.Is(err, fs.ErrNotExist)) {
+							t.Errorf("Load of non-file = %v", err)
+						}
+					}
+					for _, recursive := range []bool{false, true} {
+						got, err := s.List(ctx, tc.key, recursive)
+						if !tc.exists {
+							if !errors.Is(err, fs.ErrNotExist) {
+								t.Errorf("List(recursive=%t) = %v, want not-exist", recursive, err)
+							}
+							continue
+						}
+						want := tc.direct
+						if recursive {
+							want = tc.recursive
+						}
+						slices.Sort(got)
+						if err != nil || !slices.Equal(got, want) {
+							t.Errorf("List(recursive=%t) = %q, %v; want %q", recursive, got, err, want)
+						}
+					}
+				})
+			}
+
+			for _, target := range []string{"a/b", "u", "v", "\uffff", "😀", "leaf", "p%_", "missing"} {
+				for range 2 {
+					if err := s.Delete(ctx, target); err != nil {
+						t.Fatalf("Delete(%q): %v", target, err)
+					}
+				}
+			}
+			for _, key := range leaves {
+				value, err := s.Load(ctx, key)
+				switch key {
+				case "a/x", "ab/y", "a0/neighbor", "A/other", "pZZ/neighbor":
+					if err != nil || string(value) != "value:"+key {
+						t.Errorf("survivor Load(%q) = %q, %v", key, value, err)
+					}
+				default:
+					if !errors.Is(err, fs.ErrNotExist) {
+						t.Errorf("deleted Load(%q) = %q, %v", key, value, err)
+					}
+				}
+			}
+		})
+	}
+}
+
+// pathOracle uses literal strings and slash positions, not SQL ranges or the
+// production normalization/projection helpers. Values are distinct per write.
+type pathOracle map[string]string
+
+func referenceKey(raw string) string {
+	var result strings.Builder
+	previousSlash := false
+	for i, r := range raw {
+		if r == '\\' {
+			r = '/'
+		}
+		if i == 0 && r == '/' {
+			continue
+		}
+		if r != '/' || !previousSlash {
+			result.WriteRune(r)
+		}
+		previousSlash = r == '/'
+	}
+	return result.String()
+}
+
+func (files pathOracle) remove(raw string) {
+	key := referenceKey(raw)
+	for stored := range files {
+		if key == "" || stored == key || strings.HasPrefix(stored, key+"/") {
+			delete(files, stored)
+		}
+	}
+}
+
+func (files pathOracle) list(raw string, recursive bool) ([]string, bool) {
+	key := referenceKey(raw)
+	prefix := key
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	_, exists := files[key]
+	exists = exists || key == ""
+	children := make(map[string]bool)
+	for stored := range files {
+		if !strings.HasPrefix(stored, prefix) || stored == key {
+			continue
+		}
+		exists = true
+		child := stored
+		for i := len(prefix); i < len(stored); i++ {
+			if stored[i] == '/' {
+				if recursive {
+					children[stored[:i]] = true
+				} else {
+					child = stored[:i]
+					break
+				}
+			}
+		}
+		children[child] = true
+	}
+	delete(children, key)
+	var result []string
+	for child := range children {
+		result = append(result, child)
+	}
+	slices.Sort(result)
+	return result, exists
+}
+
+func checkPathOracle(t *testing.T, s certmagic.Storage, files pathOracle, raw string) {
+	t.Helper()
+	key := referenceKey(raw)
+	wantValue, terminal := files[key]
+	exists := terminal || key == ""
+	for stored := range files {
+		exists = exists || strings.HasPrefix(stored, key+"/")
+	}
+	if got := s.Exists(t.Context(), raw); got != exists {
+		t.Fatalf("Exists(%q), normalized %q = %t, want %t", raw, key, got, exists)
+	}
+	info, err := s.Stat(t.Context(), raw)
+	if !exists {
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("Stat(%q) = %+v, %v; want not-exist", raw, info, err)
+		}
+	} else if err != nil || info.Key != key || info.IsTerminal != terminal || (terminal && info.Size != int64(len(wantValue))) {
+		t.Fatalf("Stat(%q) = %+v, %v; want key=%q terminal=%t size=%d", raw, info, err, key, terminal, len(wantValue))
+	}
+	value, err := s.Load(t.Context(), raw)
+	switch {
+	case key == "":
+		if !errors.Is(err, fs.ErrInvalid) {
+			t.Fatalf("Load(%q) = %q, %v; want invalid root file", raw, value, err)
+		}
+	case terminal:
+		if err != nil || string(value) != wantValue {
+			t.Fatalf("Load(%q) = %q, %v; want %q", raw, value, err, wantValue)
+		}
+	case !exists:
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("Load(%q) = %q, %v; want not-exist", raw, value, err)
+		}
+	default:
+		// FileStorage reports an OS directory error, SQLite reports not-exist.
+		if err == nil {
+			t.Fatalf("Load(%q) loaded a directory: %q", raw, value)
+		}
+	}
+	for _, recursive := range []bool{false, true} {
+		want, listed := files.list(raw, recursive)
+		got, err := s.List(t.Context(), raw, recursive)
+		if !listed {
+			if !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("List(%q, %t) = %q, %v; want not-exist", raw, recursive, got, err)
+			}
+			continue
+		}
+		slices.Sort(got)
+		if err != nil || !slices.Equal(got, want) {
+			t.Fatalf("List(%q, %t) = %q, %v; want %q", raw, recursive, got, err, want)
+		}
+	}
+}
+
+func TestGeneratedPathConformance(t *testing.T) {
+	components := []string{"a", "A", "ab", "a0", "%_", "\uffff", "😀", "\U0010ffff"}
+	for _, backend := range []string{"sqlite", "filestorage"} {
+		t.Run(backend, func(t *testing.T) {
+			var s certmagic.Storage
+			if backend == "sqlite" {
+				s = newTestStorage(t)
+			} else {
+				s = &certmagic.FileStorage{Path: t.TempDir()}
+			}
+			files := make(pathOracle)
+			queries := map[string]bool{"leaf": true, "missing": true}
+			for _, left := range components {
+				queries[left] = true
+				queries[left+"/branch"] = true
+				queries[left+"x"] = true
+				for _, right := range components {
+					key := left + "/branch/" + right
+					files[key] = "value:" + key
+					queries[key] = true
+					queries[key+"x"] = true
+				}
+				key := left + "/direct"
+				files[key] = "value:" + key
+				queries[key] = true
+			}
+			files["leaf"] = "standalone"
+			for key, value := range files {
+				if err := s.Store(t.Context(), key, []byte(value)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for raw := range queries {
+				checkPathOracle(t, s, files, raw)
+			}
+			t.Logf("compared %d portable paths across five read operations on %d leaves", len(queries), len(files))
+			if backend == "sqlite" {
+				// Pinned FileStorage.Exists treats ENOTDIR as existence. Keep the
+				// stricter absent-child contract here, rather than copying that bug.
+				for key := range files {
+					checkPathOracle(t, s, files, key+"/missing")
+				}
+			}
+			// Avoid comparing retained empty filesystem directories after deletion.
+			// Exact Loads independently verify all removals and every survivor.
+			original := make([]string, 0, len(files))
+			for key := range files {
+				original = append(original, key)
+			}
+			for _, raw := range append(components, "leaf", "missing") {
+				for range 2 {
+					if err := s.Delete(t.Context(), raw); err != nil {
+						t.Fatal(err)
+					}
+				}
+				files.remove(raw)
+				for _, key := range original {
+					value, err := s.Load(t.Context(), key)
+					if want, ok := files[key]; ok {
+						if err != nil || string(value) != want {
+							t.Fatalf("Delete(%q) changed survivor %q: %q, %v", raw, key, value, err)
+						}
+					} else if !errors.Is(err, fs.ErrNotExist) {
+						t.Fatalf("Delete(%q) retained %q: %q, %v", raw, key, value, err)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestGeneratedPathAliases(t *testing.T) {
+	s := newTestStorage(t)
+	files := make(pathOracle)
+	stored := []string{
+		"leaf", "a", "a/", "a/b/c", "a/b/d", "a0/sibling", "ab/sibling", "A/other",
+		"u/\uffff", "v/😀", "w/\U0010ffff", "%_/literal", "//", "//legacy/leaf", "//legacy/deep/file",
+		"a/./literal", "a/../literal",
+	}
+	for i, raw := range stored {
+		value := strconv.Itoa(i) + ":" + raw
+		if err := s.Store(t.Context(), raw, []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+		files[referenceKey(raw)] = value
+	}
+	var queries []string
+	for _, base := range []string{
+		"", "a", "a/b", "a/b/c", "a0", "ab", "A", "u", "u/\uffff", "v/😀", "w/\U0010ffff",
+		"%_", "missing", "legacy", "legacy/leaf", "legacy/deep", "a/.", "a/..",
+	} {
+		for _, leading := range []string{"", "/", "//", "///", "\\", "\\\\", "/\\"} {
+			for _, separator := range []string{"/", "//", "\\"} {
+				for _, trailing := range []string{"", "/", "\\"} {
+					queries = append(queries, leading+strings.ReplaceAll(base, "/", separator)+trailing)
+				}
+			}
+		}
+	}
+	slices.Sort(queries)
+	queries = slices.Compact(queries)
+	for _, raw := range queries {
+		checkPathOracle(t, s, files, raw)
+	}
+	t.Logf("compared %d normalized input variants on %d records", len(queries), len(files))
+	for _, raw := range queries {
+		// Keep a full fixture between cases so neighboring paths cannot vanish
+		// before a broad or incomplete Delete has the opportunity to be caught.
+		remaining := maps.Clone(files)
+		remaining.remove(raw)
+		for range 2 {
+			if err := s.Delete(t.Context(), raw); err != nil {
+				t.Fatalf("Delete(%q): %v", raw, err)
+			}
+		}
+		checkPathOracle(t, s, remaining, "")
+		for _, key := range stored {
+			checkPathOracle(t, s, remaining, key)
+		}
+		for _, key := range stored {
+			normalized := referenceKey(key)
+			if _, ok := remaining[normalized]; !ok {
+				if err := s.Store(t.Context(), key, []byte(files[normalized])); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+}
+
+func FuzzPathOperations(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte{0, 0, 3, 0, 1, 2, 0, 0, 0, 0, 3, 0, 1, 3, 0, 0, 2, 0, 2, 0, 1, 0, 0, 0})
+	f.Add([]byte{0, 2, 2, 0, 1, 0, 0, 0, 3, 2, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0})
+	f.Add([]byte{0, 0, 2, 0, 5, 0, 0, 0, 0, 0, 2, 1, 6, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 0})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		s := newTestStorage(t)
+		files := make(pathOracle)
+		known := map[string]bool{"": true}
+		components := []string{"a", "ab", "a0", "A", "%_", "\uffff", "😀", "\U0010ffff", ".", ".."}
+		leading := []string{"", "/", "//", "\\", "\\\\", "/\\"}
+		separators := []string{"/", "//", "\\", "/\\"}
+		trailing := []string{"", "/", "//", "\\"}
+		// Grammar generation keeps every fuzz input in the valid-Unicode domain
+		// and exercises paths rather than mostly rejecting arbitrary byte strings.
+		for i := 0; i < min(len(data), 192); i += 8 {
+			var step [8]byte
+			copy(step[:], data[i:min(i+8, len(data))])
+			parts := make([]string, 0, 3)
+			for j, component := range step[3:6] {
+				if j == int(step[2]%4) {
+					break
+				}
+				parts = append(parts, components[int(component)%len(components)])
+			}
+			raw := leading[int(step[1])%len(leading)] + strings.Join(parts, separators[int(step[6])%len(separators)]) + trailing[int(step[7])%len(trailing)]
+			key := referenceKey(raw)
+			known[raw] = true
+			known[raw+"x"] = true
+			for j, r := range raw {
+				if r == '/' || r == '\\' {
+					known[raw[:j]] = true
+				}
+			}
+			switch step[0] % 5 {
+			case 0, 1:
+				value := fmt.Sprintf("write %d:%x", i/8, step)
+				err := s.Store(t.Context(), raw, []byte(value))
+				if key == "" {
+					if !errors.Is(err, fs.ErrInvalid) {
+						t.Fatalf("Store(%q) = %v; want invalid root file", raw, err)
+					}
+				} else {
+					if err != nil {
+						t.Fatal(err)
+					}
+					files[key] = value
+				}
+			case 2:
+				if err := s.Delete(t.Context(), raw); err != nil {
+					t.Fatal(err)
+				}
+				files.remove(raw)
+			case 3:
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				if err := s.Delete(ctx, raw); !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancelled Delete(%q) = %v", raw, err)
+				}
+				want := context.Canceled
+				if key == "" {
+					want = fs.ErrInvalid
+				}
+				if err := s.Store(ctx, raw, []byte("must not replace data")); !errors.Is(err, want) {
+					t.Fatalf("cancelled Store(%q) = %v, want %v", raw, err, want)
+				}
+			}
+			for probe := range known {
+				checkPathOracle(t, s, files, probe)
+			}
+		}
+		checkPathOracle(t, s, files, "")
+	})
+}
+
+func TestVirtualRoot(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := t.Context()
+	checkRoot := func(direct, recursive []string) {
+		t.Helper()
+		if !s.Exists(ctx, "") {
+			t.Error("root must exist")
+		}
+		info, err := s.Stat(ctx, "")
+		if err != nil || info.Key != "" || info.IsTerminal {
+			t.Errorf("root Stat = %+v, %v", info, err)
+		}
+		if len(recursive) == 0 && !info.Modified.IsZero() {
+			t.Errorf("empty root Modified = %v, want zero time", info.Modified)
+		}
+		for _, recurse := range []bool{false, true} {
+			got, err := s.List(ctx, "", recurse)
+			want := direct
+			if recurse {
+				want = recursive
+			}
+			slices.Sort(got)
+			if err != nil || !slices.Equal(got, want) {
+				t.Errorf("root List(recursive=%t) = %q, %v; want %q", recurse, got, err, want)
+			}
+		}
+	}
+	checkRoot(nil, nil)
+	for _, key := range []string{"", "/", "\\"} {
+		if err := s.Store(ctx, key, []byte("not a root file")); !errors.Is(err, fs.ErrInvalid) {
+			t.Errorf("Store(%q) = %v, want invalid", key, err)
+		}
+		if _, err := s.Load(ctx, key); !errors.Is(err, fs.ErrInvalid) {
+			t.Errorf("Load(%q) = %v, want invalid", key, err)
+		}
+	}
+	// Older releases allowed an empty-key file. It must not replace the
+	// virtual directory or appear in its listing, without a migration.
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO certmagic_data VALUES ('', X'01', 123)`); err != nil {
+		t.Fatal(err)
+	}
+	checkRoot(nil, nil)
+	for _, key := range []string{"a/b/c", "leaf", "\uffff/child", "😀/child"} {
+		if err := s.Store(ctx, key, []byte(key)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkRoot([]string{"a", "leaf", "\uffff", "😀"},
+		[]string{"a", "a/b", "a/b/c", "leaf", "\uffff", "\uffff/child", "😀", "😀/child"})
+	if err := s.Lock(ctx, "root-clear-lock"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := s.Unlock(ctx, "root-clear-lock"); err != nil {
+			t.Error(err)
+		}
+	}()
+	expiry := lockExpiry(t, s, "root-clear-lock")
+	for range 2 {
+		if err := s.Delete(ctx, ""); err != nil {
+			t.Fatal(err)
+		}
+		checkRoot(nil, nil)
+		var count int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM certmagic_data`).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("root clear retained %d data rows: %v", count, err)
+		}
+	}
+	if got := lockExpiry(t, s, "root-clear-lock"); got < expiry {
+		t.Errorf("root clear changed held lock: %d < %d", got, expiry)
+	}
+	if _, err := s.Load(ctx, "a/b/c"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Load after root clear = %v", err)
+	}
+	if err := s.Store(ctx, "after/clear", []byte("schema survived")); err != nil {
+		t.Fatal(err)
+	}
+	value, err := s.Load(ctx, "after/clear")
+	if err != nil || string(value) != "schema survived" {
+		t.Fatalf("Load after reuse = %q, %v", value, err)
+	}
+	// Existing normalization accepts repeated leading separators and leaves
+	// one slash in the stored key. Expanding it must not list the root itself.
+	for _, recursive := range []bool{false, true} {
+		if _, err := s.List(ctx, "//", recursive); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("missing slash-prefix List(recursive=%t) = %v, want not-exist", recursive, err)
+		}
+	}
+	if err := s.Store(ctx, "//legacy/leaf", []byte("retained")); err != nil {
+		t.Fatal(err)
+	}
+	for _, recursive := range []bool{false, true} {
+		got, err := s.List(ctx, "", recursive)
+		if err != nil || slices.Contains(got, "") {
+			t.Errorf("root List(recursive=%t) = %q, %v; must exclude root", recursive, got, err)
+		}
+		if recursive && (!slices.Contains(got, "/legacy") || !slices.Contains(got, "/legacy/leaf")) {
+			t.Errorf("recursive root List omitted leading-slash descendants: %q", got)
+		}
+		got, err = s.List(ctx, "//", recursive)
+		want := []string{"/legacy"}
+		if recursive {
+			want = append(want, "/legacy/leaf")
+		}
+		if err != nil || !slices.Equal(got, want) {
+			t.Errorf("slash-prefix List(recursive=%t) = %q, %v; want %q", recursive, got, err, want)
+		}
+	}
+	value, err = s.Load(ctx, "//legacy/leaf")
+	if err != nil || string(value) != "retained" {
+		t.Errorf("leading-separator Load = %q, %v", value, err)
+	}
+}
+
+func TestPathErrors(t *testing.T) {
+	for _, failure := range []string{"cancelled", "deadline", "closed database", "missing table"} {
+		t.Run(failure, func(t *testing.T) {
+			s := newTestStorage(t)
+			if err := s.Store(t.Context(), "dir/file", []byte("retained")); err != nil {
+				t.Fatal(err)
+			}
+			ctx := t.Context()
+			var want error
+			switch failure {
+			case "cancelled":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+				want = context.Canceled
+			case "deadline":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				defer cancel()
+				want = context.DeadlineExceeded
+			case "closed database":
+				if err := s.db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			case "missing table":
+				if _, err := s.db.ExecContext(ctx, "DROP TABLE certmagic_data"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, key := range []string{"", "dir", "dir/file", "missing"} {
+				if s.Exists(ctx, key) {
+					t.Errorf("Exists(%q) with %s must be false", key, failure)
+				}
+				_, statErr := s.Stat(ctx, key)
+				_, directErr := s.List(ctx, key, false)
+				_, recursiveErr := s.List(ctx, key, true)
+				errs := []error{statErr, directErr, recursiveErr, s.Delete(ctx, key)}
+				if key != "" {
+					_, loadErr := s.Load(ctx, key)
+					errs = append(errs, loadErr, s.Store(ctx, key, []byte("not written")))
+				}
+				for i, err := range errs {
+					if err == nil || errors.Is(err, fs.ErrNotExist) || (want != nil && !errors.Is(err, want)) {
+						t.Errorf("operation %d on %q with %s = %v; want backend/context failure %v", i, key, failure, err, want)
+					}
+				}
+			}
+			if want != nil {
+				value, err := s.Load(t.Context(), "dir/file")
+				if err != nil || string(value) != "retained" {
+					t.Errorf("cancelled operations changed data: %q, %v", value, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDirectoryStatAggregate(t *testing.T) {
+	for _, modified := range []int64{0, -1} {
+		t.Run(strconv.FormatInt(modified, 10), func(t *testing.T) {
+			s := newTestStorage(t)
+			if err := s.Store(t.Context(), "dir/file", []byte("data")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.ExecContext(t.Context(), `UPDATE certmagic_data SET modified = ?`, modified); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{"dir", ""} {
+				info, err := s.Stat(t.Context(), key)
+				if err != nil || info.IsTerminal || info.Modified.UnixMilli() != modified {
+					t.Errorf("Stat(%q) = %+v, %v; want timestamp %d", key, info, err, modified)
+				}
+			}
+		})
+	}
+	t.Run("overflow", func(t *testing.T) {
+		s := newTestStorage(t)
+		// The exact query misses normally, but evaluating directory metadata
+		// raises a genuine SQL error instead of returning an empty aggregate.
+		if _, err := s.db.ExecContext(t.Context(), `DROP TABLE certmagic_data;
+			CREATE VIEW certmagic_data AS SELECT 'dir/file' AS key,
+			X'01' AS value, abs(-9223372036854775808) AS modified`); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"dir", ""} {
+			if _, err := s.Stat(t.Context(), key); err == nil || errors.Is(err, fs.ErrNotExist) || !strings.Contains(err.Error(), "integer overflow") {
+				t.Errorf("Stat(%q) = %v, want SQL overflow", key, err)
+			}
+		}
+	})
+}
+
+func TestDirectoryStatCancellationDuringAggregate(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var called atomic.Bool
+	d := &sqlite.Driver{}
+	if err := d.RegisterScalarFunction("cancel_stat", 0, func(*sqlite.FunctionContext, []driver.Value) (driver.Value, error) {
+		called.Store(true)
+		cancel()
+		return int64(42), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Private registrations avoid affecting other SQLite tests. sql.Register
+	// requires a unique name, including when go test repeats this test.
+	driverName := "stat-cancel-" + uuid.NewString()
+	sql.Register(driverName, d)
+	db, err := sql.Open(driverName, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	s, err := NewWithDB(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := s.Store(t.Context(), "dir/file", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `ALTER TABLE certmagic_data RENAME TO stored_data;
+		CREATE VIEW certmagic_data AS SELECT key, value, cancel_stat() AS modified FROM stored_data`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Stat(ctx, "dir")
+	if !called.Load() || !errors.Is(err, context.Canceled) || errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Stat = %v, aggregate reached=%t; want cancellation", err, called.Load())
+	}
+}
+
+func TestDeleteAtomicOnFailure(t *testing.T) {
+	for _, target := range []string{"dir", ""} {
+		t.Run("target="+target, func(t *testing.T) {
+			s := newTestStorage(t)
+			leaves := []string{"dir/ascii", "dir/😀", "survivor"}
+			for _, key := range leaves {
+				if err := s.Store(t.Context(), key, []byte(key)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := s.db.ExecContext(t.Context(), `CREATE TRIGGER block_delete
+				BEFORE DELETE ON certmagic_data WHEN OLD.key = 'dir/😀'
+				BEGIN SELECT RAISE(ABORT, 'blocked deletion'); END`); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Delete(t.Context(), target); err == nil || !strings.Contains(err.Error(), "blocked deletion") {
+				t.Fatalf("Delete(%q) = %v; want failed statement", target, err)
+			}
+			for _, key := range leaves {
+				value, err := s.Load(t.Context(), key)
+				if err != nil || string(value) != key {
+					t.Errorf("failed delete changed %q: %q, %v", key, value, err)
+				}
+			}
+		})
 	}
 }
 
@@ -405,6 +1150,33 @@ func TestKeyNormalization(t *testing.T) {
 
 	if _, err := s.Load(ctx, "double/slash"); err != nil {
 		t.Errorf("Load with collapsed slash failed: %v", err)
+	}
+	for _, key := range []string{"\\path\\to", "/path/to", "path//to"} {
+		if !s.Exists(ctx, key) {
+			t.Errorf("Exists(%q) = false", key)
+		}
+		info, err := s.Stat(ctx, key)
+		if err != nil || info.Key != "path/to" || info.IsTerminal {
+			t.Errorf("Stat(%q) = %+v, %v", key, info, err)
+		}
+		for _, recursive := range []bool{false, true} {
+			got, err := s.List(ctx, key, recursive)
+			if err != nil || !slices.Equal(got, []string{"path/to/key"}) {
+				t.Errorf("List(%q, %t) = %q, %v", key, recursive, got, err)
+			}
+		}
+	}
+	for _, recursive := range []bool{false, true} {
+		got, err := s.List(ctx, "path/to/", recursive)
+		if err != nil || !slices.Equal(got, []string{"path/to/key"}) {
+			t.Errorf("List with trailing slash = %q, %v", got, err)
+		}
+	}
+	if err := s.Delete(ctx, "\\path\\to"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Load(ctx, "path/to/key"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Load after normalized Delete = %v", err)
 	}
 }
 
