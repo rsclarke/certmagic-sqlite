@@ -265,6 +265,10 @@ func (s *SQLiteStorage) Store(ctx context.Context, key string, value []byte) err
 	if key == "" {
 		return fmt.Errorf("store %q: empty key: %w", key, fs.ErrInvalid)
 	}
+	// Bind nil content as an empty BLOB, not SQL NULL.
+	if value == nil {
+		value = []byte{}
+	}
 	ctx, cancel := context.WithTimeout(ctx, s.queryTimeout)
 	defer cancel()
 

@@ -72,6 +72,48 @@ func TestStoreAndLoad(t *testing.T) {
 	}
 }
 
+func TestStoreEmptyContent(t *testing.T) {
+	for _, backend := range []string{"sqlite", "filestorage"} {
+		t.Run(backend, func(t *testing.T) {
+			for _, content := range []struct {
+				name  string
+				value []byte
+			}{
+				{"nil", nil},
+				{"empty", []byte{}},
+			} {
+				t.Run(content.name, func(t *testing.T) {
+					var s certmagic.Storage
+					if backend == "sqlite" {
+						s = newTestStorage(t)
+					} else {
+						s = &certmagic.FileStorage{Path: t.TempDir()}
+					}
+					ctx := t.Context()
+					const key = "empty/file"
+					// Exercise creation, replacement by data, and truncation back to empty.
+					for i, value := range [][]byte{content.value, []byte("replacement"), content.value} {
+						if err := s.Store(ctx, key, value); err != nil {
+							t.Fatalf("Store step %d: %v", i, err)
+						}
+						loaded, err := s.Load(ctx, key)
+						if err != nil || !slices.Equal(loaded, value) {
+							t.Fatalf("Load step %d = %q, %v; want %q", i, loaded, err, value)
+						}
+						info, err := s.Stat(ctx, key)
+						if err != nil || info.Key != key || info.Size != int64(len(value)) || !info.IsTerminal {
+							t.Fatalf("Stat step %d = %+v, %v; want terminal %q with size %d", i, info, err, key, len(value))
+						}
+						if info.Modified.IsZero() {
+							t.Errorf("Stat step %d has no modification time", i)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestLoadNotExist(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
@@ -801,8 +843,10 @@ func TestVirtualRoot(t *testing.T) {
 	}
 	checkRoot(nil, nil)
 	for _, key := range []string{"", "/", "\\"} {
-		if err := s.Store(ctx, key, []byte("not a root file")); !errors.Is(err, fs.ErrInvalid) {
-			t.Errorf("Store(%q) = %v, want invalid", key, err)
+		for _, value := range [][]byte{nil, {}, []byte("not a root file")} {
+			if err := s.Store(ctx, key, value); !errors.Is(err, fs.ErrInvalid) {
+				t.Errorf("Store(%q, %v) = %v, want invalid", key, value, err)
+			}
 		}
 		if _, err := s.Load(ctx, key); !errors.Is(err, fs.ErrInvalid) {
 			t.Errorf("Load(%q) = %v, want invalid", key, err)
